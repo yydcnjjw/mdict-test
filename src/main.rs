@@ -10,8 +10,8 @@ use std::fs::File;
 use std::io::SeekFrom;
 use std::io::{self, prelude::*};
 use std::path::Path;
+use std::u32;
 use std::usize;
-use std::{u32};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -29,17 +29,18 @@ type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, BinRead)]
 struct Mdx {
     #[br(big)]
-    meta_size: u32,
-    #[br(little, count(meta_size), try_map(|data: NullWideString| de::from_str::<Dictionary>(&data.to_string())))]
-    pub dict: Dictionary,
+    n_dict_meta: u32,
+    #[br(little, try_map(|data: NullWideString| de::from_str::<DictMeta>(&data.to_string())))]
+    pub dict: DictMeta,
     #[br(little)]
     checksum: u32,
 
     key_block: MdxKeyBlock,
+    record_block: MdxRecordBlock,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
-struct Dictionary {
+struct DictMeta {
     #[serde(rename = "GeneratedByEngineVersion")]
     pub generated_by_engine_version: f64,
     #[serde(rename = "RequiredEngineVersion")]
@@ -78,7 +79,6 @@ impl Mdx {
     fn parse(path: &Path) -> Result<Mdx> {
         let mut file = File::open(path)?;
         let v = Mdx::read(&mut file);
-        println!("read pos: {:?}", file.seek(SeekFrom::Current(0))?);
         Ok(v?)
     }
 }
@@ -86,27 +86,45 @@ impl Mdx {
 #[derive(Debug, BinRead)]
 struct MdxKeyBlock {
     #[br(big)]
-    num_blocks: u64,
+    n_blocks: u64,
     #[br(big)]
     n_entires: u64,
     #[br(big)]
-    num_bytes_decompressed: u64,
+    nb_decompressed: u64,
     #[br(big)]
-    num_bytes_info: u64,
+    nb_info: u64,
     #[br(big)]
-    num_bytes_blocks: u64,
+    nb_blocks: u64,
     #[br(little)]
     checksum: u32,
 
-    #[br(args(num_bytes_info, num_blocks))]
+    #[br(args(nb_info, n_blocks))]
     info: MdxKeyBlockInfo,
-    #[br(count(num_blocks))]
-    blocks: Vec<MdxKeyBlockItem>,
+    #[br(count(n_blocks))]
+    #[br(parse_with = |reader: &mut R, _: &ReadOptions, _: ()| -> BinResult<HashMap<u64, String>> { parse_key_entries(reader, &info) })]
+    entries: HashMap<u64, String>,
 }
 
-fn decode_key_block_info(
+#[derive(Debug, BinRead)]
+#[br(import(nb_info: u64, n_blocks: u64))]
+#[br(magic = 0x2u32)]
+struct MdxKeyBlockInfo {
+    #[br(little)]
+    checksum: u32,
+    #[br(count(nb_info - 8), try_map = |data: Vec<u8>| parse_key_block_info(data, n_blocks, checksum))]
+    data: Vec<MdxKeyBlockInfoItem>,
+}
+
+#[derive(Debug)]
+struct MdxKeyBlockInfoItem {
+    n_entries: u64,
+    nb_compressed: u64,
+    nb_decompressed: u64,
+}
+
+fn parse_key_block_info(
     mut input: Vec<u8>,
-    num_blocks: u64,
+    n_blocks: u64,
     checksum: u32,
 ) -> Result<Vec<MdxKeyBlockInfoItem>> {
     let key: Vec<u8>;
@@ -135,50 +153,32 @@ fn decode_key_block_info(
 
     let mut cursor = Cursor::new(&data);
 
-    let mut vec: Vec<MdxKeyBlockInfoItem> = Vec::with_capacity(num_blocks as usize);
+    let mut vec: Vec<MdxKeyBlockInfoItem> = Vec::with_capacity(n_blocks as usize);
 
-    for _ in 0..num_blocks {
+    for _ in 0..n_blocks {
         let n_entries: u64 = cursor.read_be()?;
 
         let head: u16 = cursor.read_be()?;
         cursor.seek(SeekFrom::Current((head + 1).into()))?;
         let tail: u16 = cursor.read_be()?;
         cursor.seek(SeekFrom::Current((tail + 1).into()))?;
-        let compressed_size = cursor.read_be::<u64>()?;
-        let decompressed_size = cursor.read_be::<u64>()?;
+        let nb_compressed = cursor.read_be::<u64>()?;
+        let nb_decompressed = cursor.read_be::<u64>()?;
 
         vec.push(MdxKeyBlockInfoItem {
             n_entries,
-            compressed_size,
-            decompressed_size,
+            nb_compressed,
+            nb_decompressed,
         });
     }
 
-    println!("num blocks: {:?}", num_blocks);
-    println!("{:?}", vec);
+    println!("num blocks: {:?}", n_blocks);
 
     Ok(vec)
 }
 
 #[derive(Debug, BinRead)]
-#[br(import(num_bytes_info: u64, num_blocks: u64))]
-#[br(magic = 0x2u32)]
-struct MdxKeyBlockInfo {
-    #[br(little)]
-    checksum: u32,
-    #[br(count(num_bytes_info - 8), try_map = |data: Vec<u8>| decode_key_block_info(data, num_blocks, checksum))]
-    data: Vec<MdxKeyBlockInfoItem>,
-}
-
-#[derive(Debug)]
-struct MdxKeyBlockInfoItem {
-    n_entries: u64,
-    compressed_size: u64,
-    decompressed_size: u64,
-}
-
-#[derive(Debug, BinRead)]
-enum KeyBlockType {
+enum ContentBlockType {
     #[br(magic = 0u32)]
     UnCompressed,
     #[br(magic = 1u32)]
@@ -188,12 +188,28 @@ enum KeyBlockType {
 }
 
 #[derive(Debug, BinRead)]
-struct MdxKeyBlockItem {
-    block_type: KeyBlockType,
+#[br(import(nb_compressed: u64, nb_decompressed: u64))]
+struct MdxContentBlock {
+    block_type: ContentBlockType,
     #[br(little)]
     checksum: u32,
-    #[br(parse_with = |reader: &mut R, _: &ReadOptions, _: ()| -> BinResult<HashMap<u64, String>> { parse_key_item(reader, &block_type) })]
-    data: HashMap<u64, String>,
+    #[br(count(nb_compressed - 8), try_map = |data: Vec<u8>| parse_key_block_item(data, &block_type, nb_decompressed))]
+    data: Vec<u8>,
+}
+
+fn parse_key_block_item(
+    input: Vec<u8>,
+    block_type: &ContentBlockType,
+    nb_decompressed: u64,
+) -> Result<Vec<u8>> {
+    println!("block_type: {:?}", block_type);
+    // TODO: block_type zlib
+    let mut block = Vec::with_capacity(nb_decompressed as usize);
+    {
+        let mut decoder = ZlibDecoder::new(Cursor::new(input));
+        decoder.read_to_end(&mut block)?;
+    }
+    Ok(block)
 }
 
 #[derive(Debug, BinRead)]
@@ -203,26 +219,20 @@ struct MdxKeyItem {
     text: NullString,
 }
 
-fn parse_key_item<R: Read + Seek>(
+fn parse_key_entries<R: Read + Seek>(
     reader: &mut R,
-    block_type: &KeyBlockType,
+    info: &MdxKeyBlockInfo,
 ) -> BinResult<HashMap<u64, String>> {
-    println!("block_type: {:?}", block_type);
-
-    let mut block = Vec::new();
-    {
-        let mut decoder = ZlibDecoder::new(reader);
-        decoder.read_to_end(&mut block)?;
-    }
-
     let mut map = HashMap::new();
-    {
-        let mut reader = Cursor::new(block);
-        let len = reader.get_ref().len() as u64;
+    for item in &info.data {
+        println!("info item: {:?}", item);
+        let block = MdxContentBlock::read_args(reader, (item.nb_compressed, item.nb_decompressed))?;
 
-        while reader.position() < len {
-            let item = reader.read_le::<MdxKeyItem>()?;
-            map.insert(item.id, item.text.to_string());
+        let mut reader = Cursor::new(block.data);
+
+        for _ in 1..item.n_entries {
+            let kv = MdxKeyItem::read(&mut reader)?;
+            map.insert(kv.id, kv.text.to_string());
         }
     }
 
@@ -230,7 +240,37 @@ fn parse_key_item<R: Read + Seek>(
     Ok(map)
 }
 
+#[derive(Debug, BinRead)]
+struct MdxRecordBlock {
+    #[br(big)]
+    n_blocks: u64,
+    #[br(big)]
+    n_entries: u64,
+    #[br(big)]
+    nb_info: u64,
+    #[br(big)]
+    nb_blocks: u64,
+    #[br(big, count(n_blocks))]
+    info: Vec<(u64, u64)>,
+    #[br(parse_with = |reader: &mut R, _: &ReadOptions, _: ()| -> BinResult<Vec<MdxContentBlock>> { parse_record_entries(reader, &info) })]
+    entries: Vec<MdxContentBlock>,
+}
+
+#[derive(Debug, BinRead)]
+struct MdxRecordItem {
+    text: NullString,
+}
+
+fn parse_record_entries<R: Read + Seek>(
+    reader: &mut R,
+    info: &Vec<(u64, u64)>,
+) -> BinResult<Vec<MdxContentBlock>> {
+    println!("record block len: {:?}", info.len());
+    info.iter()
+        .map(|item| MdxContentBlock::read_args(reader, *item))
+        .collect::<_>()
+}
+
 fn main() {
-    let mdx = Mdx::parse(Path::new("/home/yydcnjjw/Downloads/字典包/剑桥双解.mdx")).unwrap();
-    println!("{:?}", mdx);
+    let mdx = Mdx::parse(Path::new("剑桥双解.mdx")).unwrap();
 }
