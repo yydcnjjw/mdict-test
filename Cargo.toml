@@ -11,3 +11,6 @@ binread = "*"
 flate2 = "*"
 ripemd128 = "*"
 byteorder = "*"
+thiserror = "*"
+serde = { version = "*", features = [ "derive" ] }
+quick-xml = { version = "*", features = [ "serialize" ] }
