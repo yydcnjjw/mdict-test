@@ -39,8 +39,9 @@ pub struct Mdx {
 }
 
 fn parse_dict_meta(data: NullWideString) -> Result<DictMeta> {
-    println!("{:?}", data);
-    Ok(quick_xml::de::from_str::<DictMeta>(&data.to_string())?)
+    let dict = quick_xml::de::from_str::<DictMeta>(&data.to_string())?;
+    println!("{:?}", dict);
+    Ok(dict)
 }
 
 impl Mdx {
@@ -65,11 +66,11 @@ struct DictMeta {
     #[serde(rename = "KeyCaseSensitive")]
     key_case_sensitive: String,
     #[serde(rename = "StripKey")]
-    strip_key: String,
+    strip_key: Option<String>,
     #[serde(rename = "Encrypted")]
     encrypted: String,
     #[serde(rename = "RegisterBy")]
-    register_by: String,
+    register_by: Option<String>,
     #[serde(rename = "Description")]
     description: String,
     #[serde(rename = "Title")]
@@ -77,7 +78,7 @@ struct DictMeta {
     #[serde(rename = "Encoding")]
     encoding: String,
     #[serde(rename = "CreationDate")]
-    creation_date: String,
+    creation_date: Option<String>,
     #[serde(rename = "Compact")]
     compact: String,
     #[serde(rename = "Compat")]
@@ -102,17 +103,17 @@ type KeyMap = HashMap<String, u64>;
 #[derive(Debug, BinRead)]
 struct MdxKeyBlock {
     #[br(big)]
-    n_blocks: u64,
+    pub n_blocks: u64,
     #[br(big)]
-    n_entires: u64,
+    pub n_entires: u64,
     #[br(big)]
-    nb_decompressed: u64,
+    pub nb_decompressed: u64,
     #[br(big)]
-    nb_info: u64,
+    pub nb_info: u64,
     #[br(big)]
-    nb_blocks: u64,
+    pub nb_blocks: u64,
     #[br(little)]
-    checksum: u32,
+    pub checksum: u32,
 
     #[br(args(nb_info, n_blocks))]
     info: MdxKeyBlockInfo,

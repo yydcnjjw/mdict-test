@@ -16,3 +16,4 @@ serde = { version = "*", features = [ "derive" ] }
 quick-xml = { version = "*", features = [ "serialize" ] }
 # soup = "*"
 html2text = "*"
+nom = "*"
