@@ -7,7 +7,7 @@ mod mdict {
         combinator::map,
         error::{ErrorKind, ParseError},
         multi::length_count,
-        number::streaming::{be_u32, le_u16, le_u32},
+        number::streaming::{be_u32, be_u64, le_u16, le_u32},
         sequence::tuple,
         IResult, Parser,
     };
@@ -89,6 +89,27 @@ mod mdict {
         };
     }
 
+    pub fn cond_if<I, E, O1, O2, F1, F2>(
+        cond: bool,
+        mut f1: F1,
+        mut f2: F2,
+        map: impl Fn(O2) -> O1,
+    ) -> impl FnMut(I) -> IResult<I, O1, E>
+    where
+        E: ParseError<I>,
+        F1: Parser<I, O1, E>,
+        F2: Parser<I, O2, E>,
+        O1: From<O2>,
+    {
+        move |in_: I| {
+            if cond {
+                f1.parse(in_)
+            } else {
+                f2.parse(in_).map(|(i, o)| (i, map(o)))
+            }
+        }
+    }
+
     pub fn cond_number<I, E, O1, O2, F1, F2>(
         cond: bool,
         mut f1: F1,
@@ -119,16 +140,26 @@ mod mdict {
     }
 
     pub mod mdx {
-        use std::collections::HashMap;
-
-        use nom::{
-            combinator::{cond, map},
-            multi::length_count,
-            number::streaming::{be_u32, be_u64, le_u32},
-            sequence::tuple,
+        use std::{
+            collections::HashMap,
+            io::{Cursor, Read},
+            ops::RangeFrom,
         };
 
-        use super::{cond_number, dict_meta, DictMeta, NomResult, Result};
+        use byteorder::{LittleEndian, WriteBytesExt};
+
+        use flate2::read::ZlibDecoder;
+        use nom::{
+            combinator::{cond, map},
+            error::ParseError,
+            multi::{count, length_count, length_data},
+            number::streaming::{be_u16, be_u32, be_u64, be_u8, le_u16, le_u32, le_u8},
+            sequence::tuple,
+            IResult, InputIter, InputLength, Slice,
+        };
+        use ripemd128::{Digest, Ripemd128};
+
+        use super::{cond_if, cond_number, dict_meta, DictMeta, NomResult, Result};
 
         #[derive(Debug)]
         pub struct Mdx {
@@ -169,33 +200,172 @@ mod mdict {
                 },
             )(in_)?;
 
-            let (in_, km) = mdx_key_block_info(in_, &header, meta)?;
+            println!("{:?}", header);
+
+            let (in_, infos) = mdx_key_block_info(in_, &header, meta)?;
 
             Ok((in_, KeyMap::new()))
         }
 
+        #[derive(Debug)]
         struct KeyBlockInfo {
-            n_entries: u32,
-            head: u64,
-            tail: u64,
+            n_entries: u64,
+            head: String,
+            tail: String,
             nb_compressed: u64,
             nb_decompressed: u64,
         }
 
         type KeyMap = HashMap<String, u64>;
 
+        fn unzip_mdx_key_block_info(data: &[u8], checksum: u32) -> Result<Vec<u8>> {
+            let key: Vec<u8>;
+            {
+                let mut vec = Vec::with_capacity(8);
+                // TODO: unwrap
+                vec.write_u32::<LittleEndian>(checksum).unwrap();
+                vec.write_u32::<LittleEndian>(0x3695).unwrap();
+
+                let mut hasher = Ripemd128::new();
+                hasher.input(vec);
+                key = hasher.result().to_vec();
+            }
+
+            let mut prev = 0x36;
+            let data = data
+                .iter()
+                .enumerate()
+                .map(|(i, b)| {
+                    let mut t = (*b >> 4 | *b << 4) & 0xff;
+                    t = t ^ prev ^ (i & 0xff) as u8 ^ key[i % key.len()];
+
+                    prev = *b;
+                    t
+                })
+                .collect::<Vec<u8>>();
+
+            let mut input = Vec::new();
+
+            {
+                let mut decoder = ZlibDecoder::new(Cursor::new(data));
+                // TODO: unwrap
+                decoder.read_to_end(&mut input).unwrap();
+            }
+
+            Ok(input)
+        }
+
+        fn mdx_key_block_info_key<I, E>(
+            meta: &DictMeta,
+        ) -> impl FnMut(I) -> IResult<I, String, E>
+        where
+            I: Clone + Slice<RangeFrom<usize>> + InputIter<Item = u8> + InputLength,
+            E: ParseError<I>,
+        {
+            let is_ver2 = meta.is_ver2();
+            let is_utf8 = meta.encoding == "UTF-8";
+
+            cond_if(
+                is_utf8,
+                map(
+                    length_count(
+                        map(cond_number(is_ver2, be_u16, be_u8), move |v| {
+                            if is_ver2 {
+                                v + 1
+                            } else {
+                                v
+                            }
+                        }),
+                        le_u8,
+                    ),
+                    |v| String::from_utf8(v).unwrap_or_default(),
+                ),
+                map(
+                    length_count(
+                        map(cond_number(is_ver2, be_u16, be_u8), move |v| {
+                            if is_ver2 {
+                                v + 1
+                            } else {
+                                v
+                            }
+                        }),
+                        le_u16,
+                    ),
+                    |v| String::from_utf16(&v).unwrap_or_default(),
+                ),
+                |o| o,
+            )
+        }
+
+        fn mdx_key_block_info_normal<'a>(
+            in_: &'a [u8],
+            header: &KeyBlockHeader,
+            meta: &DictMeta,
+        ) -> NomResult<&'a [u8], Vec<KeyBlockInfo>> {
+            let is_ver2 = meta.is_ver2();
+
+            let (in_, infos) = count(
+                map(
+                    tuple((
+                        cond_number(is_ver2, be_u64, be_u32),
+                        mdx_key_block_info_key(meta),
+                        mdx_key_block_info_key(meta),
+                        cond_number(is_ver2, be_u64, be_u32),
+                        cond_number(is_ver2, be_u64, be_u32),
+                    )),
+                    |(n_entries, head, tail, nb_compressed, nb_decompressed): (
+                        u64,
+                        String,
+                        String,
+                        u64,
+                        u64,
+                    )| KeyBlockInfo {
+                        n_entries,
+                        head,
+                        tail,
+                        nb_compressed,
+                        nb_decompressed,
+                    },
+                ),
+                header.n_blocks as usize,
+            )(in_)?;
+
+            Ok((in_, infos))
+        }
+
         fn mdx_key_block_info<'a>(
             in_: &'a [u8],
-            head: &KeyBlockHeader,
+            header: &KeyBlockHeader,
             meta: &DictMeta,
-        ) -> NomResult<&'a [u8], KeyMap> {
-            // if (meta.is_ver2()) {
+        ) -> NomResult<&'a [u8], Vec<KeyBlockInfo>> {
+            let is_ver2 = meta.is_ver2();
 
-            // }
-            tuple(be_u32, lencount())(in_);
+            let (in_, infos) = if is_ver2 {
+                let (in_, (_, checksum, data)) = tuple((
+                    le_u32,
+                    le_u32,
+                    count(le_u8, header.nb_block_info as usize - 8),
+                ))(in_)?;
 
-            Ok((in_, KeyMap::new()))
+                let input = unzip_mdx_key_block_info(&data, checksum).unwrap();
+
+                let (_, infos) = mdx_key_block_info_normal(&input, header, meta)?;
+                (in_, infos)
+            } else {
+                mdx_key_block_info_normal(in_, header, meta)?
+            };
+
+            infos.iter().for_each(|info| println!("{:?}", info));
+
+            Ok((in_, infos))
         }
+
+        // fn mdx_key_map<'a>(
+        //     in_: &'a [u8],
+        //     infos: Vec<KeyBlockInfo>,
+        //     meta: &DictMeta,
+        // ) -> NomResult<&'a [u8], KeyMap> {
+        // }
 
         pub fn parse(in_: &[u8]) -> NomResult<&[u8], Mdx> {
             let (in_, dict_meta) = dict_meta(in_)?;
