@@ -9,6 +9,7 @@ edition = "2018"
 [dependencies]
 binread = "*"
 flate2 = { version = "*", features = ["zlib"], default-features = false }
+minilzo-rs = "*"
 ripemd128 = "*"
 byteorder = "*"
 thiserror = "*"

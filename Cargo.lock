@@ -287,6 +287,7 @@ dependencies = [
  "byteorder",
  "flate2",
  "html2text",
+ "minilzo-rs",
  "nom",
  "quick-xml",
  "ripemd128",
@@ -299,6 +300,15 @@ name = "memchr"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b16bd47d9e329435e309c58469fe0791c2d0d1ba96ec0954152a5ae2b04387dc"
+
+[[package]]
+name = "minilzo-rs"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1cfa527cd97516abf0737d3589a196fd990b67f55f5bbf260af9039191171fc"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "miniz_oxide"
